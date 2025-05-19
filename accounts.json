@@ -1,0 +1,29 @@
+[
+    {
+        "phone": "+381628231797",
+        "api_id": 24746680,
+        "api_hash": "f5c889f4a363fd3f628e7f2105720bdc",
+        "session_name": "account1",
+        "min_join_interval": 30,
+        "max_joins_per_hour": 50,
+        "max_joins_per_day": 50
+    },
+    {
+        "phone": "+381628231797",
+        "api_id": 24746680,
+        "api_hash": "f5c889f4a363fd3f628e7f2105720bdc",
+        "session_name": "account2",
+        "min_join_interval": 30,
+        "max_joins_per_hour": 50,
+        "max_joins_per_day": 50
+    },
+    {
+        "phone": "+34617108387",
+        "api_id": 24746680,
+        "api_hash": "f5c889f4a363fd3f628e7f2105720bdc",
+        "session_name": "account3",
+        "min_join_interval": 30,
+        "max_joins_per_hour": 50,
+        "max_joins_per_day": 50
+    }
+]
