@@ -20,7 +20,7 @@ class DelayManager:
         # Увеличиваем задержку с каждым последовательным вступлением
         current_delay = self.base_delay + (self.consecutive_joins * 5)
         delay = current_delay + random.uniform(0, self.max_extra)
-        
+        delay = min(delay, 200)  # Жёсткий лимит: не больше 200 секунд
         print(f"⏳ Ожидание {delay:.1f} секунд перед следующим чатом...")
         await asyncio.sleep(delay)
         self.last_action_time = time.time()

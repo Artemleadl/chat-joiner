@@ -6,7 +6,7 @@
         "session_name": "account1",
         "min_join_interval": 30,
         "max_joins_per_hour": 50,
-        "max_joins_per_day": 50
+        "max_joins_per_day": 200
     },
     {
         "phone": "+381628231797",
@@ -15,7 +15,7 @@
         "session_name": "account2",
         "min_join_interval": 30,
         "max_joins_per_hour": 50,
-        "max_joins_per_day": 50
+        "max_joins_per_day": 200
     },
     {
         "phone": "+34617108387",
@@ -24,6 +24,6 @@
         "session_name": "account3",
         "min_join_interval": 30,
         "max_joins_per_hour": 50,
-        "max_joins_per_day": 50
+        "max_joins_per_day": 200
     }
 ]

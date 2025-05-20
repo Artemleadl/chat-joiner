@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict
 import asyncio
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, ChatAdminRequiredError, UsernameInvalidError, UsernameNotOccupiedError
 import json
 import os
 import random
@@ -18,7 +18,7 @@ class TelegramAccount:
     session_name: str
     min_join_interval: int = 60
     max_joins_per_hour: int = 20
-    max_joins_per_day: int = 100
+    max_joins_per_day: int = 200
     device_model: str = "PC"
     system_version: str = "Windows 10"
     app_version: str = "4.8"
@@ -30,6 +30,7 @@ class TelegramAccount:
     last_join_time: float = None
     total_joins: int = 0
     last_reset_time: float = None
+    proxy: Optional[tuple] = None
 
 class AccountManager:
     def __init__(self, accounts_file: str = 'accounts.json', db_file: str = 'joins_history.db'):
@@ -39,7 +40,7 @@ class AccountManager:
         self.current_account_index = 0
         self.init_db()
         self.load_accounts()
-        self.joins_before_switch = random.randint(10, 20)  # Увеличено с 5-15 до 10-20
+        self.joins_before_switch = random.randint(10, 20)
         self.current_joins = 0
 
     def init_db(self):
@@ -53,7 +54,10 @@ class AccountManager:
                 chat_name TEXT,
                 timestamp REAL,
                 success BOOLEAN,
-                error_message TEXT
+                error_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                last_retry_time REAL,
+                is_banned BOOLEAN DEFAULT FALSE
             )
         ''')
         conn.commit()
@@ -174,7 +178,11 @@ class AccountManager:
             print("❌ Нет доступных аккаунтов")
             return None
 
-        client = TelegramClient(account.session_name, account.api_id, account.api_hash)
+        proxy = getattr(account, 'proxy', None)
+        if proxy:
+            client = TelegramClient(account.session_name, account.api_id, account.api_hash, proxy=tuple(proxy))
+        else:
+            client = TelegramClient(account.session_name, account.api_id, account.api_hash)
         try:
             await client.start(phone=account.phone)
             # Устанавливаем параметры устройства в сессии
@@ -183,7 +191,7 @@ class AccountManager:
             session.system_version = getattr(account, 'system_version', 'Windows 10')
             session.app_version = getattr(account, 'app_version', '4.8')
             session.lang_code = getattr(account, 'lang_code', 'en')
-            await client.session.save()
+            client.session.save()
             account.last_used = time.time()
             return client
         except Exception as e:
@@ -199,16 +207,86 @@ class AccountManager:
             return True
         return False
 
+    def is_banned_error(self, error_message: str) -> bool:
+        """Проверяет, является ли ошибка результатом бана"""
+        banned_keywords = [
+            "banned",
+            "blocked",
+            "restricted",
+            "flood",
+            "too many requests",
+            "too many attempts"
+        ]
+        return any(keyword in error_message.lower() for keyword in banned_keywords)
+
+    def should_retry_join(self, chat_name: str) -> bool:
+        """Проверяет, нужно ли повторить попытку вступления в чат"""
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        
+        # Получаем последнюю запись для этого чата
+        c.execute('''
+            SELECT success, error_message, retry_count, last_retry_time, is_banned
+            FROM joins_history 
+            WHERE chat_name = ? 
+            ORDER BY timestamp DESC LIMIT 1
+        ''', (chat_name,))
+        
+        result = c.fetchone()
+        conn.close()
+        
+        if not result:
+            return True
+            
+        success, error_message, retry_count, last_retry_time, is_banned = result
+        
+        # Если успешно вступили или это не бан - не повторяем
+        if success or not is_banned:
+            return False
+            
+        # Если уже было 3 попытки - не повторяем
+        if retry_count >= 3:
+            return False
+            
+        # Если прошло меньше часа с последней попытки - не повторяем
+        if last_retry_time and time.time() - last_retry_time < 3600:
+            return False
+            
+        return True
+
     def mark_join(self, account: TelegramAccount, chat_name: str, success: bool = True, error_message: str = None):
         """Отмечает вступление в чат в базе данных"""
         current_time = time.time()
         
+        # Проверяем, нужно ли увеличить счетчик попыток
         conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
+        
+        # Получаем количество предыдущих попыток
         c.execute('''
-            INSERT INTO joins_history (account_phone, chat_name, timestamp, success, error_message)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (account.phone, chat_name, current_time, success, error_message))
+            SELECT retry_count FROM joins_history 
+            WHERE chat_name = ? 
+            ORDER BY timestamp DESC LIMIT 1
+        ''', (chat_name,))
+        
+        result = c.fetchone()
+        retry_count = (result[0] + 1) if result else 0
+        
+        # Определяем, является ли ошибка результатом бана
+        is_banned = False if success else self.is_banned_error(error_message)
+        
+        # Сохраняем запись
+        c.execute('''
+            INSERT INTO joins_history (
+                account_phone, chat_name, timestamp, success, 
+                error_message, retry_count, last_retry_time, is_banned
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            account.phone, chat_name, current_time, success,
+            error_message, retry_count, current_time, is_banned
+        ))
+        
         conn.commit()
         conn.close()
 
@@ -257,4 +335,16 @@ class AccountManager:
             "total_successful": total_successful,
             "last_24h": last_24h,
             "last_hour": last_hour
-        } 
+        }
+
+    def get_min_floodwait_seconds(self) -> Optional[int]:
+        """
+        Возвращает минимальное время до окончания FloodWait среди всех аккаунтов,
+        если все аккаунты под FloodWait. Если есть хотя бы один доступный, возвращает None.
+        """
+        now = time.time()
+        floodwaits = [max(0, acc.flood_wait_until - now) for acc in self.accounts]
+        # Если хотя бы один аккаунт не под FloodWait, возвращаем None
+        if any(wait <= 0 for wait in floodwaits):
+            return None
+        return int(min(floodwaits)) 

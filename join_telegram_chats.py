@@ -8,7 +8,7 @@ import sqlite3
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, ChatAdminRequiredError, UsernameInvalidError, UsernameNotOccupiedError
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.functions.messages import GetDialogsRequest, GetHistoryRequest, AddReactionRequest
+from telethon.tl.functions.messages import GetDialogsRequest, GetHistoryRequest, SendReactionRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.types import InputPeerEmpty, InputMessageID, ReactionEmoji
 from delay_manager import DelayManager
@@ -26,6 +26,21 @@ DB_FILE = 'chats.db'
 delay_manager = DelayManager(base_delay=30, max_extra=10)
 account_manager = AccountManager()
 
+def with_retry_sqlite(func):
+    def wrapper(*args, **kwargs):
+        attempts = 5
+        for i in range(attempts):
+            try:
+                return func(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if 'database is locked' in str(e):
+                    print(f"⚠️ database is locked, попытка {i+1}/{attempts}, жду...")
+                    time.sleep(1.5)
+                else:
+                    raise
+        raise sqlite3.OperationalError('database is locked (после 5 попыток)')
+    return wrapper
+
 # --- Работа с базой данных ---
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -42,6 +57,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+@with_retry_sqlite
 def save_chat_to_db(chat_id, title, username, chat_type):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -93,10 +109,10 @@ def normalize_chat_link(link):
     return {'type': 'username', 'username': link}
 
 # --- Проверка наличия чата в базе ---
+@with_retry_sqlite
 def is_chat_in_db(chatname):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Проверяем по username (основной способ)
     c.execute('SELECT 1 FROM chats WHERE username = ?', (chatname,))
     result = c.fetchone()
     conn.close()
@@ -194,11 +210,10 @@ async def emulate_human_activity(client):
                 print(f"  👁️ Чтение сообщения {msg.id}")
                 # Пробуем поставить реакцию (лайк)
                 try:
-                    await client(AddReactionRequest(
+                    await client(SendReactionRequest(
                         peer=chat,
-                        id=[msg.id],
-                        reaction=[ReactionEmoji(emoticon='👍')],
-                        big=True
+                        msg_id=msg.id,
+                        reaction=['👍']
                     ))
                     print(f"  👍 Поставлена реакция на сообщение {msg.id}")
                 except Exception:
@@ -216,6 +231,12 @@ async def join_chat(client, chat_link, account):
                 print(f"⏩ Уже состоите в чате (инвайт): {chat_id}, пропускаю...")
                 account_manager.mark_join(account, chat_id, success=False, error_message="Already joined (invite)")
                 return True
+                
+            # Проверяем, нужно ли повторить попытку
+            if not account_manager.should_retry_join(chat_id):
+                print(f"⏩ Пропускаю чат {chat_id} - не требуется повторная попытка")
+                return True
+                
             print(f"Попытка присоединиться по инвайт-ссылке: {chat_id}")
             await client(ImportChatInviteRequest(chat_id))
             print(f"✅ Успешно присоединился по инвайт-ссылке: {chat_id}")
@@ -231,6 +252,12 @@ async def join_chat(client, chat_link, account):
                 print(f"⏩ Уже состоите в чате: {chatname}, пропускаю...")
                 account_manager.mark_join(account, chatname, success=False, error_message="Already joined")
                 return True
+                
+            # Проверяем, нужно ли повторить попытку
+            if not account_manager.should_retry_join(chatname):
+                print(f"⏩ Пропускаю чат {chatname} - не требуется повторная попытка")
+                return True
+                
             print(f"Попытка присоединиться к чату: {chatname}")
             await client(JoinChannelRequest(chatname))
             print(f"✅ Успешно присоединился к чату: {chatname}")
@@ -241,34 +268,17 @@ async def join_chat(client, chat_link, account):
                 await emulate_human_activity(client)
             return True
     except FloodWaitError as e:
-        wait_time = e.seconds
-        print(f"⚠️ FloodWait! Ожидание {wait_time} секунд...")
-        log_error(chat_link, f"FloodWait: ожидание {wait_time} секунд", str(e))
-        account_manager.mark_join(account, chat_link, success=False, error_message=f"FloodWait: {wait_time}s")
-        account_manager.mark_account_flood_wait(account, wait_time)
-        # После FloodWait обязательно эмулируем активность
-        await emulate_human_activity(client)
+        print(f"⚠️ FloodWait: {e.seconds} секунд")
+        account_manager.mark_join(account, chat_link, success=False, error_message=f"FloodWait: {e.seconds} seconds")
+        account_manager.mark_account_flood_wait(account, e.seconds)
         return False
-    except ChatAdminRequiredError as e:
-        print(f"❌ Не удалось присоединиться к чату {chat_link}: требуется одобрение администратора")
-        log_error(chat_link, "Требуется одобрение администратора", str(e))
-        account_manager.mark_join(account, chat_link, success=False, error_message="Admin approval required")
-        return True
-    except UsernameInvalidError as e:
-        print(f"❌ Неверный формат имени пользователя: {chat_link}")
-        log_error(chat_link, "Неверный формат имени пользователя", str(e))
-        account_manager.mark_join(account, chat_link, success=False, error_message="Invalid username")
-        return True
-    except UsernameNotOccupiedError as e:
-        print(f"❌ Чат не существует: {chat_link}")
-        log_error(chat_link, "Чат не существует", str(e))
-        account_manager.mark_join(account, chat_link, success=False, error_message="Chat doesn't exist")
+    except (ChatAdminRequiredError, UsernameInvalidError, UsernameNotOccupiedError) as e:
+        print(f"❌ Ошибка при вступлении в чат {chat_link}: {str(e)}")
+        account_manager.mark_join(account, chat_link, success=False, error_message=str(e))
         return True
     except Exception as e:
-        print(f"❌ Ошибка при присоединении к чату {chat_link}: {str(e)}")
-        log_error(chat_link, "Другая ошибка", str(e))
+        print(f"❌ Неизвестная ошибка при вступлении в чат {chat_link}: {str(e)}")
         account_manager.mark_join(account, chat_link, success=False, error_message=str(e))
-        await delay_manager.adaptive_sleep()
         return True
 
 async def print_account_stats(account):
@@ -284,16 +294,22 @@ async def main():
     init_db()
     # Загружаем список чатов из файла
     with open('chat_list.txt', 'r', encoding='utf-8') as f:
-        chat_links = [line.strip() for line in f if line.strip()]
+        chat_links = list(dict.fromkeys(line.strip() for line in f if line.strip()))
 
     while chat_links:  # Продолжаем, пока есть чаты для вступления
         # Создание клиента
         client = await account_manager.create_client()
         if not client:
-            print("❌ Не удалось создать клиент. Проверьте файл accounts.json")
-            # Делаем длительную паузу перед следующей попыткой
-            print("⏳ Ожидание 5 минут перед следующей попыткой...")
-            await asyncio.sleep(300)
+            min_floodwait = account_manager.get_min_floodwait_seconds()
+            if min_floodwait is not None:
+                pause = min_floodwait + 120
+                print(f"⏳ Все аккаунты под FloodWait. Ожидание {pause} секунд до следующей попытки...")
+                await asyncio.sleep(pause)
+            else:
+                print("❌ Не удалось создать клиент. Проверьте файл accounts.json")
+                # Делаем длительную паузу перед следующей попыткой
+                print("⏳ Ожидание 5 минут перед следующей попыткой...")
+                await asyncio.sleep(300)
             continue
 
         try:
